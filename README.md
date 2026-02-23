@@ -1,6 +1,18 @@
 # A-EVOLVE Monorepo
 
-Official implementation of **[Position: Agentic Evolution is the Path to Evolving LLMs](https://arxiv.org/abs/2602.00359)** (arXiv 2602.00359).
+[![GitHub stars](https://img.shields.io/github/stars/A-EVO-Lab/a-evolve?style=social)](https://github.com/A-EVO-Lab/a-evolve)
+
+Note: A-evolve is under active development. Star ⭐ this repo to get notified about our latest update and benchmark results.
+
+## 🚀 Roadmap & Community Evolution
+
+We are evolving fast! Support our research by leaving a ⭐.
+
+- [x] Release the official implementation of **[Position: Agentic Evolution is the Path to Evolving LLMs](https://arxiv.org/abs/2602.00359)** (arXiv 2602.00359).
+- [ ] Open-source the distributed evolution infra (Massive-scale).
+- [ ] Open-source the infra for more diverse benchmarks 
+
+## What is A-EVOLVE?
 
 A-EVOLVE is a framework for agentic evolution of LLMs at deployment time. Rather than relying on static training, A-EVOLVE treats deployment-time improvement as a deliberate, goal-directed optimization process — an autonomous evolver agent that diagnoses failures, proposes improvements, and persists durable changes over time.
 
@@ -169,3 +181,7 @@ You can override both paths via `AEVOLVE_SESSIONS_DIR` and `AEVOLVE_EXPERIMENTS_
 
 - UI details: `a-evolve-ui/README.md`
 - Core framework details: `agentic-evolution/README.md`
+ 
+## Supporting our research
+If you find A-evolve helpful in your research or production, please give us a star! It helps our team secure more compute resources to push the boundaries of agentic evolution.
+
