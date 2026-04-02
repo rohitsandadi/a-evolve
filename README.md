@@ -146,7 +146,35 @@ print(f"Final score: {results.final_score:.3f}")
 print(f"Converged:   {results.converged}")
 ```
 
-A-Evolve ships with built-in seed workspaces (`swe`, `mcp`, `terminal`, `skillbench`) and benchmark adapters (`swe-verified`, `mcp-atlas`, `terminal-bench 2.0`, `skill-bench`). Point `agent=` at any of them — or at your own workspace directory.
+A-Evolve ships with built-in seed workspaces for `swe`, `mcp`, and `terminal`, plus a dedicated SkillBench workspace under `seed_workspaces/skillbench`. Built-in benchmark adapters include `swe-verified`, `mcp-atlas`, `terminal-bench 2.0`, and `skill-bench`.
+
+### SkillBench Setup
+
+Install the SkillBench runtime extras first:
+
+```bash
+pip install -e ".[skillbench,dev]"
+```
+
+On first SkillBench run, A-Evolve can auto-bootstrap the public [`benchflow-ai/skillsbench`](https://github.com/benchflow-ai/skillsbench) repo into `~/.cache/agent-evolve/skillbench/<ref>/repo` by default. The pinned default ref is `828bb921fb94dc065bfefd6bac4e8938be3f71e0`, which matches the vendored Terminus pin used by this repo.
+
+Native example:
+
+```bash
+python examples/skillbench_examples/skillbench_solve_one.py \
+  --mode native \
+  --use-skills true
+```
+
+Harbor example:
+
+```bash
+python examples/skillbench_examples/skillbench_solve_one.py \
+  --mode harbor \
+  --use-skills false
+```
+
+You can override the auto-bootstrap with `SKILLBENCH_REPO_DIR`, `SKILLBENCH_REPO_REF`, `SKILLBENCH_TASKS_DIR`, `SKILLBENCH_TASKS_NO_SKILLS_DIR`, or `SKILLBENCH_HARBOR_REPO`. For the full setup matrix and troubleshooting guide, see [SkillBench Setup Guide](docs/skillbench-setup.md).
 
 ### 3. Bring Your Own Agent (BYOA)
 
@@ -170,7 +198,7 @@ results = evolver.run(cycles=10)
 
 Your agent's evolvable state (prompts, skills, memory) lives as a standard directory — the [Agent Workspace](#the-agent-workspace-a-file-system-contract). A-Evolve mutates these files; your agent reloads. See [Architecture & Design](#architecture--design) for the full picture.
 
-For benchmark-specific walkthroughs, see [SWE-bench Demo Guide](docs/swe-bench-demo.md) and [MCP-Atlas Demo Guide](docs/mcp-atlas-demo.md).
+For benchmark-specific walkthroughs, see [SWE-bench Demo Guide](docs/swe-bench-demo.md), [MCP-Atlas Demo Guide](docs/mcp-atlas-demo.md), and [SkillBench Setup Guide](docs/skillbench-setup.md).
 
 ---
 
@@ -220,7 +248,7 @@ A-Evolve ships with ready-to-use benchmark adapters and seed workspaces:
 | [`swe-verified`](docs/swe-bench-demo.md) | Real-world GitHub issues (Python repos) | `seed_workspaces/swe/` | **76.8%** (~#5) |
 | [`mcp-atlas`](docs/mcp-atlas-demo.md) | Tool-calling via MCP (16+ servers) | `seed_workspaces/mcp/` | **79.4%** (🥇 #1) |
 | [`terminal-bench`](docs/terminal-bench-demo.md) | Terminal/CLI ops in Docker | `seed_workspaces/terminal/` | **76.5%** (~#7) |
-| [`skill-bench`](docs/skill-bench-demo.md) | Agentic skill discovery | `seed_workspaces/reasoning/` | **34.9%** (~#2)|
+| [`skill-bench`](docs/skillbench-setup.md) | Agentic skill discovery | `seed_workspaces/skillbench/` | **34.9%** (~#2)|
 
 ### Pluggability: Bring Your Own Everything
 
