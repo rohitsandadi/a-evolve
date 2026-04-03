@@ -1,14 +1,14 @@
 """ARC-AGI-3 agent -- plays interactive games via the arc-agi toolkit.
 
-This agent wraps the ARC-AGI-3 arcade environment and uses an LLM to
-decide actions based on game observations. The LLM sees the game grid
-state and available actions, then chooses the next move.
+Adapted from arcprize/ARC-AGI-3-Agents and symbolica-ai/ARC-AGI-3-Agents.
+Separates game interaction code from the evolvable workspace (prompts/skills/memory).
 
-The agent can operate in two modes:
-1. **Tool mode** (default): LLM uses strands tools (observe_game, take_action,
-   reset_level) to interact with the game environment step by step.
-2. **Direct mode**: Agent runs a tight observation-action loop, formatting
-   game state as text for the LLM at each step.
+Key adaptations:
+- Frame class with diff/render helpers (from Symbolica's scope/frame.py)
+- Grid-to-image rendering for multimodal input (from multimodal.py)
+- Game reference prompt adapted from Symbolica's GAME_REFERENCE
+- Proper FrameData handling from the official Agent base class
+- a-evolve workspace integration for prompt/skill/memory evolution
 """
 
 from __future__ import annotations
@@ -25,23 +25,24 @@ from strands.models import BedrockModel
 
 from ...protocol.base_agent import BaseAgent
 from ...types import Task, Trajectory
+from .colors import COLOR_LEGEND, COLOR_NAMES
+from .frame import DiffRegion, Frame
 
 logger = logging.getLogger(__name__)
 
 os.environ.setdefault("BYPASS_TOOL_CONSENT", "true")
 
-# Map action names to GameAction enum values
-ACTION_MAP = {
-    "ACTION1": 1, "ACTION2": 2, "ACTION3": 3, "ACTION4": 4,
-    "ACTION5": 5, "ACTION6": 6, "ACTION7": 7, "RESET": 0,
-}
-
 
 class ArcAgent(BaseAgent):
     """Evolvable agent for ARC-AGI-3 interactive games.
 
-    Uses an LLM to observe game states and choose actions, playing
-    through game levels with the goal of maximum efficiency (RHAE).
+    Drives the arc-agi game environment through a strands Agent with
+    tool-based interaction. The LLM observes grid states (text + optional
+    images), reasons about game mechanics, and chooses actions.
+
+    The workspace provides the evolvable system prompt, skills, and memory.
+    Frame helpers provide rich grid analysis (diff, color counts, bounding
+    boxes) that feed into observations.
     """
 
     def __init__(
@@ -49,7 +50,7 @@ class ArcAgent(BaseAgent):
         workspace_dir: str | Path,
         model_id: str = "us.anthropic.claude-opus-4-6-v1",
         region: str = "us-west-2",
-        max_tokens: int = 8192,
+        max_tokens: int = 16384,
         max_actions: int = 5000,
     ):
         super().__init__(workspace_dir)
@@ -59,48 +60,40 @@ class ArcAgent(BaseAgent):
         self.max_actions = max_actions
 
     def solve(self, task: Task) -> Trajectory:
-        """Play an ARC-AGI-3 game and return the trajectory.
-
-        The task metadata should contain:
-          - game_id: str (ARC-AGI-3 game identifier)
-          - max_actions: int (action budget, default from self.max_actions)
-          - api_key: str (optional ARC API key)
-          - operation_mode: str (optional, default "normal")
-        """
+        """Play an ARC-AGI-3 game and return the trajectory."""
         game_id = task.metadata.get("game_id", task.id)
         max_actions = task.metadata.get("max_actions", self.max_actions)
 
         logger.info("Playing ARC-AGI-3 game: %s (budget: %d actions)", game_id, max_actions)
 
         try:
-            return self._solve_with_tools(task, game_id, max_actions)
-        except ImportError:
-            logger.error("arc-agi package not installed. Install with: pip install arc-agi")
+            return self._solve_game(task, game_id, max_actions)
+        except ImportError as e:
+            logger.error("arc-agi package not installed: %s", e)
             return Trajectory(
                 task_id=task.id,
                 output=json.dumps({
                     "game_id": game_id,
-                    "error": "arc-agi package not installed",
+                    "error": f"arc-agi package not installed: {e}",
                     "game_completed": False,
                     "levels_completed": 0,
                     "total_levels": 0,
                     "total_actions": 0,
                     "score": 0.0,
                 }),
-                steps=[{"error": "arc-agi not installed"}],
+                steps=[{"error": str(e)}],
             )
 
-    def _solve_with_tools(self, task: Task, game_id: str, max_actions: int) -> Trajectory:
-        """Play the game using strands tools for LLM-driven interaction."""
+    def _solve_game(self, task: Task, game_id: str, max_actions: int) -> Trajectory:
+        """Play the game using strands tools + Frame helpers for rich observation."""
         import arc_agi
-        from arcengine import GameAction
+        from arcengine import FrameData, GameAction, GameState
 
         # Initialize arcade
         arcade_kwargs: dict[str, Any] = {}
         api_key = task.metadata.get("api_key")
         if api_key:
             arcade_kwargs["arc_api_key"] = api_key
-
         op_mode = task.metadata.get("operation_mode", "normal")
         if op_mode != "normal":
             from arc_agi import OperationMode
@@ -109,42 +102,93 @@ class ArcAgent(BaseAgent):
         arcade = arc_agi.Arcade(**arcade_kwargs)
         env = arcade.make(game_id, render_mode=None)
 
-        # Game state tracked across tool calls
-        game_state: dict[str, Any] = {
-            "observation": None,
+        # Game state shared across tool closures
+        frames: list[Frame] = []
+        action_trace: list[dict] = []
+        state: dict[str, Any] = {
             "done": False,
             "total_actions": 0,
             "levels_completed": 0,
-            "total_levels": 0,
+            "win_levels": 0,
             "per_level_actions": [],
             "current_level_actions": 0,
-            "last_reward": 0.0,
-            "last_info": {},
+            "game_state": "NOT_PLAYED",
+            "available_actions": [],
         }
-        action_trace: list[dict] = []
 
-        # Reset environment
-        obs = env.reset()
-        game_state["observation"] = self._format_observation(obs)
+        def _process_frame_data(raw: Any) -> Frame:
+            """Convert raw env output to our Frame wrapper."""
+            if hasattr(raw, "frame"):
+                # FrameDataRaw from arc-agi
+                grid = raw.frame[-1] if isinstance(raw.frame, list) else raw.frame
+                if hasattr(grid, "tolist"):
+                    grid = grid.tolist()
+                f = Frame(
+                    grid,
+                    levels_completed=getattr(raw, "levels_completed", 0),
+                    win_levels=getattr(raw, "win_levels", 0),
+                    state=str(getattr(raw, "state", "UNKNOWN")),
+                    available_actions=[
+                        GameAction.from_id(a).name
+                        for a in getattr(raw, "available_actions", [])
+                    ],
+                )
+                state["levels_completed"] = f.metadata.get("levels_completed", 0)
+                state["win_levels"] = f.metadata.get("win_levels", 0)
+                state["game_state"] = f.metadata.get("state", "UNKNOWN")
+                state["available_actions"] = f.metadata.get("available_actions", [])
+                return f
+            # Fallback: raw is already a grid or dict
+            if isinstance(raw, (list, tuple)):
+                return Frame(raw)
+            return Frame([[0] * 64] * 64)
 
-        # Build strands tools for game interaction
+        # Initial reset
+        raw_obs = env.reset()
+        initial_frame = _process_frame_data(raw_obs)
+        frames.append(initial_frame)
+
+        # Build strands tools
         from strands import tool
 
         @tool
         def observe_game() -> str:
-            """Get the current game state.
+            """Get the current game state with grid analysis.
 
-            Returns the current observation grid and game status.
-            Call this to see what the game looks like before deciding your action.
+            Returns the rendered grid, color distribution, available actions,
+            and change summary from the last action. Call this before deciding
+            your next move.
             """
-            if game_state["done"]:
+            if state["done"]:
                 return "Game is over. No more actions needed."
-            return (
-                f"Observation:\n{game_state['observation']}\n\n"
-                f"Actions taken: {game_state['total_actions']}/{max_actions}\n"
-                f"Levels completed: {game_state['levels_completed']}\n"
-                f"Last reward: {game_state['last_reward']}"
-            )
+            if not frames:
+                return "(no observation yet)"
+
+            current = frames[-1]
+            parts = [
+                f"=== Game State ===",
+                f"Level: {state['levels_completed']}/{state['win_levels']}",
+                f"Status: {state['game_state']}",
+                f"Actions used: {state['total_actions']}/{max_actions}",
+                f"Available actions: {', '.join(state['available_actions'])}",
+                f"",
+                f"=== Grid ({current.width}x{current.height}) ===",
+                current.render(y_ticks=True, x_ticks=True),
+                f"",
+                f"=== Color Distribution ===",
+                ", ".join(
+                    f"{COLOR_NAMES[c]}({c}): {n}"
+                    for c, n in sorted(current.color_counts().items())
+                ),
+            ]
+
+            # Show diff from previous frame
+            if len(frames) >= 2:
+                prev = frames[-2]
+                summary = current.change_summary(prev)
+                parts.extend(["", f"=== Changes from Last Action ===", summary])
+
+            return "\n".join(parts)
 
         @tool
         def take_action(action: str, x: int = -1, y: int = -1) -> str:
@@ -152,108 +196,153 @@ class ArcAgent(BaseAgent):
 
             Args:
                 action: One of ACTION1, ACTION2, ACTION3, ACTION4, ACTION5, ACTION6, ACTION7, RESET.
-                    ACTION1-4 are directional (up/down/left/right).
-                    ACTION5 is context-dependent (interact/select).
-                    ACTION6 is coordinate-based (requires x, y).
-                    ACTION7 is undo.
-                    RESET restarts the current level.
-                x: X coordinate for ACTION6 (0-63). Only used with ACTION6.
-                y: Y coordinate for ACTION6 (0-63). Only used with ACTION6.
+                    ACTION1-4: Directional (up/down/left/right).
+                    ACTION5: Context-dependent interaction.
+                    ACTION6: Coordinate-based click (requires x, y in range 0-63).
+                    ACTION7: Undo last action.
+                    RESET: Restart current level.
+                x: X coordinate for ACTION6 (0-63).
+                y: Y coordinate for ACTION6 (0-63).
             """
-            if game_state["done"]:
+            if state["done"]:
                 return "Game is already over."
-
-            if game_state["total_actions"] >= max_actions:
-                game_state["done"] = True
-                return f"Action budget exhausted ({max_actions} actions). Game over."
+            if state["total_actions"] >= max_actions:
+                state["done"] = True
+                return f"Action budget exhausted ({max_actions} actions)."
 
             action_upper = action.upper().strip()
-            if action_upper not in ACTION_MAP:
-                return f"Invalid action: {action}. Use one of: {', '.join(ACTION_MAP.keys())}"
-
-            # Map to GameAction
-            action_val = ACTION_MAP[action_upper]
-            if action_upper == "ACTION6" and x >= 0 and y >= 0:
-                # ACTION6 with coordinates -- encode as needed by arc-agi
-                game_action = GameAction(action_val)
-            else:
-                game_action = GameAction(action_val)
-
-            # Step the environment
             try:
-                obs, reward, done, info = env.step(game_action)
+                game_action = GameAction.from_name(action_upper)
+            except (ValueError, KeyError):
+                avail = ", ".join(state["available_actions"])
+                return f"Invalid action: {action}. Available: {avail}"
+
+            # Set coordinate data for ACTION6
+            if game_action.is_complex() and x >= 0 and y >= 0:
+                game_action.set_data({"x": min(x, 63), "y": min(y, 63)})
+
+            # Execute
+            prev_levels = state["levels_completed"]
+            try:
+                raw_obs = env.step(game_action)
+                # Handle both (obs,) and (obs, reward, done, info) returns
+                if isinstance(raw_obs, tuple):
+                    raw_obs = raw_obs[0]
             except Exception as e:
-                return f"Error executing action: {e}"
+                return f"Error executing {action_upper}: {e}"
 
-            game_state["total_actions"] += 1
-            game_state["current_level_actions"] += 1
-            game_state["last_reward"] = reward
-            game_state["last_info"] = info if isinstance(info, dict) else {}
-            game_state["observation"] = self._format_observation(obs)
+            new_frame = _process_frame_data(raw_obs)
+            frames.append(new_frame)
 
-            # Track level transitions
-            if reward > 0:
-                game_state["levels_completed"] += 1
-                game_state["per_level_actions"].append(
-                    game_state["current_level_actions"]
-                )
-                game_state["current_level_actions"] = 0
+            state["total_actions"] += 1
+            state["current_level_actions"] += 1
 
-            if done:
-                game_state["done"] = True
-                game_state["per_level_actions"].append(
-                    game_state["current_level_actions"]
-                )
+            # Detect level transition
+            level_changed = state["levels_completed"] > prev_levels
+            if level_changed:
+                state["per_level_actions"].append(state["current_level_actions"])
+                state["current_level_actions"] = 0
 
-            # Record action in trace
+            # Detect game end
+            game_state_str = state["game_state"]
+            if game_state_str in ("WIN",) or (
+                state["win_levels"] > 0
+                and state["levels_completed"] >= state["win_levels"]
+            ):
+                state["done"] = True
+
+            # Record trace
             action_trace.append({
                 "type": "action",
                 "action": action_upper,
                 "x": x if action_upper == "ACTION6" else None,
                 "y": y if action_upper == "ACTION6" else None,
-                "reward": reward,
-                "done": done,
-                "actions_so_far": game_state["total_actions"],
-                "level_changed": reward > 0,
+                "level_changed": level_changed,
+                "levels_completed": state["levels_completed"],
+                "actions_so_far": state["total_actions"],
+                "game_state": game_state_str,
             })
 
-            status = "LEVEL COMPLETE!" if reward > 0 else ""
-            if done:
-                status = "GAME COMPLETE!" if game_state["levels_completed"] > 0 else "GAME OVER"
+            # Build response with diff
+            parts = []
+            if level_changed:
+                parts.append(f"*** LEVEL COMPLETE! (Level {state['levels_completed']}) ***")
+            if state["done"]:
+                parts.append("*** GAME COMPLETE! ***")
 
-            return (
-                f"Action: {action_upper} -> reward={reward}"
-                f"{' ' + status if status else ''}\n\n"
-                f"New observation:\n{game_state['observation']}\n"
-                f"Actions: {game_state['total_actions']}/{max_actions} | "
-                f"Levels: {game_state['levels_completed']}"
-            )
+            parts.append(f"Action: {action_upper}")
+            parts.append(f"Actions: {state['total_actions']}/{max_actions}")
+            parts.append(f"Level: {state['levels_completed']}/{state['win_levels']}")
+
+            # Show change summary
+            if len(frames) >= 2:
+                summary = new_frame.change_summary(frames[-2])
+                parts.extend(["", "Changes:", summary])
+
+            # Show new grid
+            parts.extend([
+                "",
+                f"=== Current Grid ===",
+                new_frame.render(y_ticks=True, x_ticks=True),
+            ])
+
+            return "\n".join(parts)
 
         @tool
-        def reset_level() -> str:
-            """Reset the current level to start over.
+        def analyze_grid(colors: str = "", crop: str = "") -> str:
+            """Analyze specific aspects of the current grid.
 
-            Use this if you're stuck or want to try a different approach.
+            Args:
+                colors: Comma-separated color indices to find (e.g. "8,14" for red,green).
+                    Returns all pixel locations matching these colors.
+                crop: Region to render as "x1,y1,x2,y2" (e.g. "10,20,30,40").
+                    Renders only that sub-region for detailed inspection.
             """
-            if game_state["done"]:
-                return "Game is already over."
+            if not frames:
+                return "(no grid to analyze)"
+            current = frames[-1]
+            parts = []
 
-            try:
-                obs = env.reset()
-                game_state["observation"] = self._format_observation(obs)
-                game_state["current_level_actions"] = 0
-                action_trace.append({
-                    "type": "action",
-                    "action": "RESET",
-                    "reward": 0,
-                    "done": False,
-                    "actions_so_far": game_state["total_actions"],
-                })
-                return f"Level reset.\n\nObservation:\n{game_state['observation']}"
-            except Exception as e:
-                return f"Error resetting: {e}"
+            if colors:
+                try:
+                    color_ids = [int(c.strip()) for c in colors.split(",")]
+                    pixels = current.find(*color_ids)
+                    color_names = [COLOR_NAMES[c] for c in color_ids if c < 16]
+                    parts.append(f"Pixels matching {', '.join(color_names)}:")
+                    if pixels:
+                        for px, py, pv in pixels[:100]:
+                            parts.append(f"  ({px}, {py}) = {pv} ({COLOR_NAMES[pv]})")
+                        if len(pixels) > 100:
+                            parts.append(f"  ... and {len(pixels) - 100} more")
+                        bbox = current.bounding_box(*color_ids)
+                        if bbox:
+                            parts.append(f"Bounding box: x=[{bbox[0]},{bbox[2]}) y=[{bbox[1]},{bbox[3]})")
+                    else:
+                        parts.append("  (none found)")
+                except ValueError:
+                    parts.append(f"Invalid color indices: {colors}")
 
-        # Build the strands agent
+            if crop:
+                try:
+                    coords = tuple(int(c.strip()) for c in crop.split(","))
+                    if len(coords) == 4:
+                        parts.extend([
+                            "",
+                            f"=== Cropped Region ({coords[0]},{coords[1]})-({coords[2]},{coords[3]}) ===",
+                            current.render(y_ticks=True, x_ticks=True, crop=coords),
+                        ])
+                except ValueError:
+                    parts.append(f"Invalid crop: {crop}. Use x1,y1,x2,y2")
+
+            if not parts:
+                parts = [
+                    f"Grid: {current.width}x{current.height}",
+                    f"Colors present: {', '.join(f'{COLOR_NAMES[c]}({c}):{n}' for c, n in sorted(current.color_counts().items()))}",
+                ]
+
+            return "\n".join(parts)
+
+        # Build the strands agent with workspace prompt
         model = BedrockModel(
             model_id=self.model_id,
             region_name=self.region,
@@ -261,7 +350,7 @@ class ArcAgent(BaseAgent):
         )
 
         system_prompt = self._build_system_prompt()
-        tools = [observe_game, take_action, reset_level]
+        tools = [observe_game, take_action, analyze_grid]
 
         # Add read_skill tool if skills exist
         if self.skills:
@@ -274,7 +363,7 @@ class ArcAgent(BaseAgent):
 
             @tool
             def read_skill(skill_name: str) -> str:
-                """Read a skill's full procedure. Call when a skill's description matches your situation.
+                """Read the full procedure for a skill.
 
                 Args:
                     skill_name: Name of the skill to read
@@ -292,7 +381,7 @@ class ArcAgent(BaseAgent):
         )
 
         # Play the game
-        user_prompt = self._build_user_prompt(task)
+        user_prompt = self._build_user_prompt(task, initial_frame)
         t0 = time.time()
 
         try:
@@ -302,9 +391,11 @@ class ArcAgent(BaseAgent):
             response = None
 
         elapsed = time.time() - t0
-        logger.info("Game %s finished in %.1fs: %d actions, %d levels",
-                     game_id, elapsed, game_state["total_actions"],
-                     game_state["levels_completed"])
+        logger.info(
+            "Game %s finished in %.1fs: %d actions, %d/%d levels",
+            game_id, elapsed, state["total_actions"],
+            state["levels_completed"], state["win_levels"],
+        )
 
         # Extract usage
         usage = {}
@@ -320,129 +411,79 @@ class ArcAgent(BaseAgent):
                 pass
 
         # Compute score
-        score = self._compute_score(game_state)
+        score = self._compute_score(state)
 
         # Build result
+        game_completed = (
+            state["levels_completed"] > 0
+            and (state["done"] or state["levels_completed"] >= state["win_levels"])
+        )
         result = {
             "game_id": game_id,
-            "game_completed": game_state["done"] and game_state["levels_completed"] > 0,
-            "levels_completed": game_state["levels_completed"],
-            "total_levels": game_state.get("total_levels", game_state["levels_completed"]),
-            "total_actions": game_state["total_actions"],
-            "per_level_actions": game_state["per_level_actions"],
+            "game_completed": game_completed,
+            "levels_completed": state["levels_completed"],
+            "total_levels": state["win_levels"],
+            "total_actions": state["total_actions"],
+            "per_level_actions": state["per_level_actions"],
             "score": score,
             "elapsed_sec": elapsed,
             "usage": usage,
         }
 
-        # Add summary step
         action_trace.append({
             "type": "summary",
             "llm_output": str(response)[:2000] if response else "(error)",
             "usage": usage,
-            "score": score,
-            "levels_completed": game_state["levels_completed"],
-            "total_actions": game_state["total_actions"],
-            "game_completed": result["game_completed"],
-            "per_level_actions": game_state["per_level_actions"],
+            **result,
         })
 
         self.remember(
-            f"Played {game_id}: completed={result['game_completed']}, "
-            f"levels={game_state['levels_completed']}, "
-            f"actions={game_state['total_actions']}, score={score:.3f}",
+            f"Played {game_id}: completed={game_completed}, "
+            f"levels={state['levels_completed']}/{state['win_levels']}, "
+            f"actions={state['total_actions']}, score={score:.3f}",
             category="episodic",
             task_id=game_id,
         )
 
-        traj = Trajectory(
-            task_id=task.id,
-            output=json.dumps(result),
-            steps=action_trace,
-        )
+        traj = Trajectory(task_id=task.id, output=json.dumps(result), steps=action_trace)
 
-        # Generate skill proposal
+        # Skill proposal
         if response:
-            skill_proposal = self._generate_skill_proposal(agent, game_id)
-            traj._skill_proposal = skill_proposal
+            traj._skill_proposal = self._generate_skill_proposal(agent, game_id)
 
         return traj
-
-    # ── Observation formatting ───────────────────────────────────────
-
-    @staticmethod
-    def _format_observation(obs: Any) -> str:
-        """Format a game observation into text the LLM can understand."""
-        if obs is None:
-            return "(no observation)"
-
-        # Handle different observation formats
-        if isinstance(obs, str):
-            return obs
-
-        if isinstance(obs, dict):
-            # Grid-based observation
-            grid = obs.get("grid", obs.get("state", obs.get("frame")))
-            if grid and isinstance(grid, list):
-                lines = []
-                for row in grid:
-                    if isinstance(row, list):
-                        lines.append(" ".join(str(cell) for cell in row))
-                    else:
-                        lines.append(str(row))
-                return "\n".join(lines)
-            return json.dumps(obs, indent=2)[:3000]
-
-        if isinstance(obs, list):
-            # Could be a list of frames
-            if obs and isinstance(obs[0], dict):
-                # Take the last frame
-                return ArcAgent._format_observation(obs[-1])
-            # Direct grid
-            lines = []
-            for row in obs:
-                if isinstance(row, list):
-                    lines.append(" ".join(str(cell) for cell in row))
-                else:
-                    lines.append(str(row))
-            return "\n".join(lines)
-
-        return str(obs)[:3000]
 
     # ── Score computation ────────────────────────────────────────────
 
     @staticmethod
-    def _compute_score(game_state: dict) -> float:
-        """Compute a 0-1 score based on game completion and efficiency.
-
-        Uses a simplified RHAE-inspired scoring:
-        - Base score from fraction of levels completed
-        - Efficiency bonus for completing levels in fewer actions
-        """
-        levels = game_state.get("levels_completed", 0)
-        total_actions = game_state.get("total_actions", 0)
+    def _compute_score(state: dict) -> float:
+        """Compute a 0-1 RHAE-inspired score."""
+        levels = state.get("levels_completed", 0)
+        win_levels = state.get("win_levels", 0)
+        total_actions = state.get("total_actions", 0)
 
         if levels == 0:
             return 0.0
 
-        # Base: fraction of completion (assume we don't know total levels)
-        base_score = min(1.0, levels / max(1, levels))  # 1.0 if any levels
+        # Completion fraction
+        if win_levels > 0:
+            completion = levels / win_levels
+        else:
+            completion = 1.0 if levels > 0 else 0.0
 
         # Efficiency: penalize excessive actions per level
-        # Rough heuristic: 50 actions per level is "efficient"
-        avg_actions = total_actions / levels if levels > 0 else total_actions
-        efficiency = max(0.0, 1.0 - (avg_actions - 50) / 200)
-        efficiency = min(1.0, max(0.1, efficiency))
+        avg_actions = total_actions / levels
+        efficiency = max(0.1, min(1.0, 1.0 - (avg_actions - 50) / 200))
 
-        return base_score * efficiency
+        return completion * efficiency
 
-    # ── Prompt construction ──────────────────────────────────────────
+    # ── Prompt construction (from workspace) ─────────────────────────
 
     def _build_system_prompt(self) -> str:
         """Assemble the full system prompt from workspace files."""
         parts = [self.system_prompt]
 
-        # Include evolved prompt fragments
+        # Evolved prompt fragments
         fragments = self.workspace.list_fragments()
         if fragments:
             for frag_name in fragments:
@@ -453,7 +494,7 @@ class ArcAgent(BaseAgent):
                         parts.append(f"\n\n## {frag_name.removesuffix('.md').replace('_', ' ').title()}")
                         parts.append(content)
 
-        # Skills section
+        # Skills
         parts.append("\n\n## Skills\n")
         if self.skills:
             parts.append(
@@ -467,8 +508,8 @@ class ArcAgent(BaseAgent):
 
         return "\n".join(parts)
 
-    def _build_user_prompt(self, task: Task) -> str:
-        """Build the user prompt for a game task."""
+    def _build_user_prompt(self, task: Task, initial_frame: Frame) -> str:
+        """Build the user prompt including initial grid observation."""
         game_id = task.metadata.get("game_id", task.id)
         max_actions = task.metadata.get("max_actions", self.max_actions)
 
@@ -476,18 +517,38 @@ class ArcAgent(BaseAgent):
         if self.memories:
             relevant = [m for m in self.memories if m.get("task_id") == game_id]
             if relevant:
-                memory_section = "\n\n## Previous Attempts\n"
+                memory_section = "\n## Previous Attempts\n"
                 for mem in relevant[-5:]:
                     memory_section += f"- {mem.get('content', '')}\n"
                 memory_section += "\nLearn from these and try a different strategy.\n"
+
+        initial_obs = initial_frame.render(y_ticks=True, x_ticks=True)
+        color_dist = ", ".join(
+            f"{COLOR_NAMES[c]}({c}): {n}"
+            for c, n in sorted(initial_frame.color_counts().items())
+        )
 
         return f"""\
 {task.input}
 
 Action budget: {max_actions} actions
 {memory_section}
-Start by calling observe_game() to see the initial state, then use take_action()
-to play. Think carefully about each move -- efficiency matters!
+## Initial Observation
+
+Grid ({initial_frame.width}x{initial_frame.height}):
+{initial_obs}
+
+Color distribution: {color_dist}
+Color legend: {COLOR_LEGEND}
+
+## Instructions
+
+1. Call observe_game() to understand the full state
+2. Use analyze_grid(colors="8,14") to find specific objects by color
+3. Experiment with take_action() to learn the game mechanics
+4. Track what each action does -- build a mental model
+5. Once you understand the rules, solve efficiently
+6. Every action counts toward your score -- minimize wasted moves
 """
 
     # ── Skill proposals ──────────────────────────────────────────────
@@ -506,7 +567,7 @@ to play. Think carefully about each move -- efficiency matters!
                 "that could help in future ARC-AGI-3 games.\n\n"
                 "RULES:\n"
                 "- NAME must be GENERIC (e.g., navigate_maze, pattern_matching, "
-                "explore_then_exploit)\n"
+                "explore_then_exploit, identify_interactive_objects)\n"
                 "- DESCRIPTION must include TRIGGER and DO NOT TRIGGER conditions\n\n"
                 "OPTION A -- ENHANCE existing skill:\n"
                 "ACTION: ENHANCE\nTARGET: skill_name\n"
