@@ -69,6 +69,7 @@ By applying our open-source **reference evolution algorithms** to a base Claude 
 > *All results achieved with a single Claude Opus-4.6 base model, evolved using A-Evolve's sample algorithms. 0 hours of human harness engineering. Data checked March 2026.*
 
 ### News
+- **04/03** **Integration**, A-Evolve added new evolutionary algorithm Meta-Harness
 - **03/30** **Integration**, A-Evolve is officially integrated into [AutoResearchClaw](https://github.com/aiming-lab/AutoResearchClaw) 
 - **03/25** 🚀 **Open-source A-Evolve**, the universal infrastructure for developing and testing evolving algorithms.
 - **03/25** 📊 **Open-source 4 evolving algorithms** developed with A-Evolve, achieving SOTA **(#1, ~#5, ~#7, #2)** on MCP-Atlas, SWE-bench Verified, Terminal-Bench 2.0, and SkillsBench.
