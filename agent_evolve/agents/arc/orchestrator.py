@@ -28,6 +28,7 @@ from typing import Any, Callable
 from .colors import COLOR_LEGEND, COLOR_NAMES
 from .frame import Frame
 from .memories import Memories
+from .repl import PersistentREPL
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class SubAgent:
         action_budget: int,
         memories: Memories,
         level: int = 0,
+        max_code_calls: int = 10,
     ):
         self.client = client
         self.model_id = model_id
@@ -62,9 +64,12 @@ class SubAgent:
         self.actions_taken = 0
         self.memories = memories
         self.level = level
+        self.max_code_calls = max_code_calls
+        self._code_calls = 0
         self._messages: list[dict] = []
         self._total_input_tokens = 0
         self._total_output_tokens = 0
+        self.repl = PersistentREPL()
 
     @property
     def budget_remaining(self) -> int:
@@ -81,6 +86,47 @@ class SubAgent:
         parts.append(f"\n\n## Your Role: {self.role}")
         parts.append(f"Objective: {self.objective}")
         parts.append(f"Action budget: {self.action_budget} actions (use them wisely)")
+
+        # Python REPL instructions
+        parts.append(f"""
+
+## Python REPL (CRITICAL -- use this!)
+
+You have a persistent Python REPL. Write code to analyze the grid BEFORE choosing actions.
+Code execution does NOT cost action budget. You get {self.max_code_calls} code calls.
+
+To execute code, respond with a ```python block:
+```python
+# Find all distinct colored regions
+colors = frame.color_counts()
+print("Colors:", colors)
+
+# Find red pixels and their bounding box
+red_pixels = frame.find(8)
+print(f"Red: {{len(red_pixels)}} pixels at {{red_pixels[:5]}}")
+bbox = frame.bounding_box(8)
+print(f"Red bbox: {{bbox}}")
+
+# Compare with previous frame
+if prev_frame:
+    diff = frame.diff(prev_frame)
+    for region in diff:
+        print(f"Changed: {{region}}")
+```
+
+Pre-loaded variables (updated each step):
+- `frame`: Current Frame object with .grid, .grid_np, .render(), .diff(), .find(), .color_counts(), .bounding_box()
+- `grid`: numpy int8 array of current grid (64x64)
+- `prev_frame`: Previous frame (or None)
+- `frames`: List of all frames
+- `meta`: Game metadata dict
+- `np`: numpy
+- State persists between code calls (variables you define are kept)
+
+To take a game action, respond with JSON (costs 1 action):
+{{"action": "ACTION1", "reasoning": "why"}}
+
+STRATEGY: Always analyze with code first, then act. Code is free, actions are expensive.""")
 
         # Include shared memories
         mem_text = self.memories.format_for_prompt(max_entries=15)
@@ -99,10 +145,20 @@ class SubAgent:
     ) -> tuple[str, str]:
         """Get one action from this sub-agent via LLM call.
 
+        The LLM can respond with:
+        1. A ```python code block → executed in REPL (FREE, no action cost)
+        2. A JSON action → returned as game action (costs 1 action)
+
+        Code blocks loop: execute code, feed output back, ask again.
+        This continues until the LLM emits a game action or hits code call limit.
+
         Returns (action_string, full_response_text).
         """
         if self.budget_exhausted:
             return "NOOP", "Budget exhausted"
+
+        # Update REPL with current game state
+        self.repl.update_frame(latest, frames, meta)
 
         system_prompt = self.build_system_prompt(workspace_prompt)
         observation = format_observation(
@@ -117,44 +173,74 @@ class SubAgent:
             "content": [{"text": observation}],
         })
 
-        # Trim history
-        if len(self._messages) > 16:
-            self._messages = self._messages[-16:]
+        # Loop: LLM may emit code blocks before choosing an action
+        all_response_text = ""
+        for _ in range(self.max_code_calls + 1):
+            # Trim history
+            if len(self._messages) > 20:
+                self._messages = self._messages[-20:]
 
-        try:
-            response = self.client.converse(
-                modelId=self.model_id,
-                system=[{"text": system_prompt}],
-                messages=self._messages,
-                inferenceConfig={
-                    "maxTokens": self.max_tokens,
-                    "temperature": 0.3,
-                },
-            )
+            try:
+                response = self.client.converse(
+                    modelId=self.model_id,
+                    system=[{"text": system_prompt}],
+                    messages=self._messages,
+                    inferenceConfig={
+                        "maxTokens": self.max_tokens,
+                        "temperature": 0.3,
+                    },
+                )
 
-            content = response.get("output", {}).get("message", {}).get("content", [])
-            text = "".join(b.get("text", "") for b in content)
+                content = response.get("output", {}).get("message", {}).get("content", [])
+                text = "".join(b.get("text", "") for b in content)
+                all_response_text += text + "\n"
 
-            usage = response.get("usage", {})
-            self._total_input_tokens += usage.get("inputTokens", 0)
-            self._total_output_tokens += usage.get("outputTokens", 0)
+                usage = response.get("usage", {})
+                self._total_input_tokens += usage.get("inputTokens", 0)
+                self._total_output_tokens += usage.get("outputTokens", 0)
 
-            self._messages.append({
-                "role": "assistant",
-                "content": [{"text": text}],
-            })
+                self._messages.append({
+                    "role": "assistant",
+                    "content": [{"text": text}],
+                })
 
-            action_str = extract_action(text)
-            self.actions_taken += 1
+                # Extract memories from any response
+                self._extract_memories(text)
 
-            # Extract and store any memory entries the agent wants to save
-            self._extract_memories(text)
+                # Check if response contains a code block
+                code = extract_code_block(text)
+                if code and self._code_calls < self.max_code_calls:
+                    # Execute code in REPL (FREE -- no action cost)
+                    self._code_calls += 1
+                    result = self.repl.exec(code)
+                    logger.debug(
+                        "%s code exec #%d: %s",
+                        self.role, self._code_calls,
+                        result.output[:100] if result.success else result.error[:100],
+                    )
 
-            return action_str, text
+                    # Feed code output back as user message
+                    output_text = str(result)
+                    if len(output_text) > 2000:
+                        output_text = output_text[:2000] + "\n... [truncated]"
+                    self._messages.append({
+                        "role": "user",
+                        "content": [{"text": f"[Code output #{self._code_calls}]:\n{output_text}\n\nNow choose: more ```python analysis, or a game action JSON."}],
+                    })
+                    continue  # Loop back for next response
 
-        except Exception as e:
-            logger.error("SubAgent %s LLM error: %s", self.role, e)
-            return "RESET", f"LLM error: {e}"
+                # No code block (or code limit reached) → extract game action
+                action_str = extract_action(text)
+                self.actions_taken += 1
+                return action_str, all_response_text
+
+            except Exception as e:
+                logger.error("SubAgent %s LLM error: %s", self.role, e)
+                return "RESET", f"LLM error: {e}"
+
+        # Code call limit exhausted without an action -- force one
+        self.actions_taken += 1
+        return "RESET", all_response_text
 
     def _extract_memories(self, text: str) -> None:
         """Extract MEMORY: entries from the agent's response."""
@@ -486,26 +572,49 @@ def format_observation(
         parts.append(f"Legend: {COLOR_LEGEND}")
 
     parts.append(
-        "\nRespond with JSON: "
-        '{"action": "ACTION1", "reasoning": "why"}'
-        '\nFor ACTION6: {"action": "ACTION6", "x": 32, "y": 32, "reasoning": "why"}'
-        "\nTo save a finding: add a line starting with MEMORY: summary | details"
+        "\nOptions:"
+        "\n1. Analyze with code (FREE): ```python\\ncode here\\n```"
+        '\n2. Take action (costs 1): {"action": "ACTION1", "reasoning": "why"}'
+        '\n   For ACTION6: {"action": "ACTION6", "x": 32, "y": 32, "reasoning": "why"}'
+        "\n3. Save finding: MEMORY: summary | details"
+        "\nTip: Always analyze with code first, then act."
     )
 
     return "\n".join(parts)
 
 
+def extract_code_block(text: str) -> str | None:
+    """Extract a ```python code block from LLM response.
+
+    Returns the code string if found, None otherwise.
+    Only matches python-fenced blocks to avoid capturing JSON examples.
+    """
+    # Match ```python ... ``` blocks
+    match = re.search(r'```python\s*\n(.*?)```', text, re.DOTALL)
+    if match:
+        code = match.group(1).strip()
+        if code:
+            return code
+    return None
+
+
 def extract_action(text: str) -> str:
-    """Extract action name from LLM response text."""
+    """Extract action name from LLM response text.
+
+    Skips any python code blocks to avoid matching action names in code comments.
+    """
+    # Remove code blocks before searching for actions
+    clean = re.sub(r'```python.*?```', '', text, flags=re.DOTALL)
+
     # Try JSON
-    json_match = re.search(r'\{[^{}]*"action"\s*:\s*"([^"]+)"[^{}]*\}', text)
+    json_match = re.search(r'\{[^{}]*"action"\s*:\s*"([^"]+)"[^{}]*\}', clean)
     if json_match:
         return json_match.group(1).upper()
 
     # Try plain action name
     for name in ["RESET", "ACTION7", "ACTION6", "ACTION5",
                  "ACTION4", "ACTION3", "ACTION2", "ACTION1"]:
-        if name in text.upper():
+        if name in clean.upper():
             return name
 
     return "RESET"
