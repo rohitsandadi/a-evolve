@@ -204,5 +204,57 @@ class Frame:
             return None
         return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
 
+    def render_diff(
+        self,
+        other: "Frame",
+        keys: str = "0123456789abcdef",
+        gap: str = " ",
+        crop: "tuple[int, int, int, int] | str | None" = None,
+    ) -> str:
+        """Render a visual diff. Call as new_frame.render_diff(old_frame).
+
+        Changed cells show their new value; unchanged cells show '.'.
+        """
+        regions = self.diff(other)
+        if not regions:
+            return "No changes."
+
+        all_changes: dict[tuple[int, int], int] = {}
+        total = 0
+        for region in regions:
+            for x, y, _, new_val in region.changes:
+                all_changes[(x, y)] = new_val
+            total += region.count
+
+        if crop == "auto":
+            min_x = min(r.x0 for r in regions)
+            min_y = min(r.y0 for r in regions)
+            max_x = max(r.x1 for r in regions)
+            max_y = max(r.y1 for r in regions)
+        elif isinstance(crop, tuple):
+            min_x, min_y, max_x, max_y = crop
+        else:
+            min_x, min_y = 0, 0
+            max_x, max_y = self.width, self.height
+
+        header = f"{total} changes in {len(regions)} region{'s' if len(regions) != 1 else ''}"
+        lines: list[str] = [header]
+        pad = "       "
+        lines.append(pad + gap.join(str(c // 10) for c in range(min_x, max_x)))
+        lines.append(pad + gap.join(str(c % 10) for c in range(min_x, max_x)))
+        data_width = len(gap.join("x" for _ in range(min_x, max_x)))
+        lines.append(pad + "-" * data_width)
+
+        for y in range(min_y, max_y):
+            cells: list[str] = []
+            for x in range(min_x, max_x):
+                if (x, y) in all_changes:
+                    cells.append(keys[all_changes[(x, y)]])
+                else:
+                    cells.append(".")
+            lines.append(f"y={y:>2d} | {gap.join(cells)}")
+
+        return "\n".join(lines)
+
     def __repr__(self) -> str:
         return f"Frame({self.width}x{self.height}, colors={len(self.color_counts())})"
