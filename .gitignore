@@ -50,6 +50,7 @@ inspect_evals/
 !/docs/
 /docs/*
 !/docs/skillbench-setup.md
+!/docs/algorithms/
 !/tests/
 /tests/*
 !/tests/test_skillbench_setup.py

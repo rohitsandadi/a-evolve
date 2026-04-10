@@ -4,7 +4,7 @@ Provides:
 - make_evaluator(): serial evaluator for single-threaded GEPA
 - make_parallel_evaluator(): thread-safe worker pool for parallel GEPA
 - build_side_info(): structured ASI for GEPA's reflection LLM
-- compress_trajectory(): bounded trajectory compression (gskill-style, no LLM call)
+- compress_trajectory(): bounded trajectory compression (head+tail heuristic, no LLM call)
 """
 
 from __future__ import annotations
@@ -183,7 +183,7 @@ def _compress_steps(steps: list[dict]) -> str:
 
 
 def _truncate(text: str | None, limit: int) -> str:
-    """gskill-style truncation: head + '...' + tail for long strings."""
+    """Truncation: head + '...' + tail for long strings."""
     if not text:
         return ""
     if len(text) <= limit:
